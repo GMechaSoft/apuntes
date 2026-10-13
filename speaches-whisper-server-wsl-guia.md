@@ -12,6 +12,7 @@
 | Motor | Speaches (`ghcr.io/speaches-ai/speaches`) |
 | Imagen | `0.9.0-rc.1-cuda-12.6.3` |
 | Modelo STT | `h2oai/faster-whisper-large-v3-turbo` |
+| Declaración del modelo | Por petición (campo `model`), no en la config |
 | Dispositivo / cuantización | `cuda` / `int8` |
 | Puerto | `8000` (API compatible con OpenAI) |
 | TTL del modelo | `-1` (nunca se descarga de VRAM) |
@@ -30,7 +31,99 @@ Inicio de sesión Windows
 
 ---
 
-## 2. Prerrequisitos (verificar una vez)
+## 2. Modelo conceptual: declaración, descarga y memoria
+
+Esta sección aclara cómo Speaches gestiona los modelos, para entender por qué la primera
+puesta en marcha exige pasos manuales y por qué "descargar" (disco) no es lo mismo que
+"cargar" (VRAM).
+
+### 2.1. ¿Dónde se declara el modelo?
+
+**No existe** un equivalente a `WHISPER_MODEL`. Speaches no mantiene una lista fija de
+modelos en la configuración: el modelo se elige **en cada petición** con el campo `model`:
+
+```bash
+curl -s http://localhost:8000/v1/audio/transcriptions \
+  -F file=@/tmp/test.wav \
+  -F model="h2oai/faster-whisper-large-v3-turbo"
+```
+
+Las variables `WHISPER__*` (`inference_device`, `compute_type`) solo configuran la
+**inferencia**, no la identidad del modelo. La única lista opcional es `PRELOAD_MODELS`
+(ver §2.4), que sirve para descargar en el arranque, no para fijar el modelo de las
+peticiones.
+
+### 2.2. Los tres estados de un modelo
+
+| Estado | Significado | Qué lo dispara |
+|---|---|---|
+| **Registro (registry)** | El modelo "existe" y es válido (`library_name: ctranslate2`, `pipeline_tag`) | Descubrimiento en HuggingFace (`GET /v1/registry`) |
+| **Instalado / descargado** | Está en disco (`hf_cache`) | **Descarga explícita** (`model download` / `POST /v1/models/<id>`) o `PRELOAD_MODELS` al arranque |
+| **Cargado en VRAM** | Ocupa memoria GPU | **Primera petición** que usa ese modelo (carga dinámica) |
+
+### 2.3. La petición NO descarga el modelo
+
+A diferencia de `faster-whisper-server` (que descarga automáticamente a partir de
+`WHISPER_MODEL`), Speaches **no descarga** el modelo al recibir una transcripción. Si el
+modelo no está instalado, responde `"not installed locally"`.
+
+El modelo se deja disponible de forma **explícita y una sola vez** (queda persistente en
+disco, ver §2.5):
+
+```bash
+# Vía oficial (funciona si la tarjeta HF ya declara library_name / pipeline_tag)
+uvx speaches-cli model download Systran/faster-whisper-large-v3
+
+# Equivalente por API
+curl -X POST "http://localhost:8000/v1/models/Systran/faster-whisper-large-v3"
+```
+
+El modelo `h2oai/faster-whisper-large-v3-turbo` **no** declara esos metadatos, por lo que
+la vía oficial falla (404 en `POST /v1/models` y `"not installed locally"`). De ahí el
+*workaround* de §4.2 (`patch_model.py`): descarga manual a `hf_cache` + parche del
+`README.md`.
+
+### 2.4. Precarga en el arranque (`PRELOAD_MODELS`)
+
+```yaml
+environment:
+  - PRELOAD_MODELS=["Systran/faster-whisper-large-v3"]
+```
+
+- **Descarga** (a disco, secuencialmente) durante el arranque.
+- Si un modelo falla o no está en el registro, **la aplicación no arranca**.
+- **No lo carga en VRAM**; solo lo deja en disco. La carga en VRAM sigue ocurriendo en la
+  primera petición.
+- ⚠️ No está disponible en la imagen `0.9.0-rc.1` de esta guía; se añadió en `0.9.0-rc.3`
+  (cuyas imágenes `0.9.0-rc.3-*` ya están publicadas en GHCR). Ver lección 2 de §6.
+- ⚠️ El modelo listado debe existir en el *registry* (metadatos `library_name`/
+  `pipeline_tag`). `h2oai/faster-whisper-large-v3-turbo` no los declara, así que el
+  preload **fallaría** con él (error `Model ... not found` al arrancar). El parche de §4.2
+  **no** lo evita: `PRELOAD_MODELS` valida contra el *registry remoto* de HuggingFace,
+  mientras que §4.2 solo corrige el README **local** (lo que habilita la transcripción,
+  no la precarga). Precargar este modelo exigiría corregir sus metadatos en el propio repo
+  de HuggingFace.
+
+### 2.5. Persistencia en VRAM: `STT_MODEL_TTL`
+
+| Valor | Efecto |
+|---|---|
+| `-1` | **Nunca se descarga de VRAM**. Permanece residente todo el tiempo que el contenedor esté vivo; las siguientes peticiones son inmediatas. |
+| `300` (default) | Se libera de VRAM tras 5 min de inactividad; la siguiente petición lo recarga desde disco (~5 s). |
+| `0` | Se libera inmediatamente tras cada uso. |
+
+**Distinción disco vs. memoria:**
+
+- **Disco (`hf_cache`)**: el modelo descargado persiste siempre (bind mount), incluso tras
+  reiniciar el contenedor.
+- **VRAM**: se libera **siempre al reiniciar el contenedor**, sin importar el TTL.
+  `STT_MODEL_TTL=-1` solo evita la descarga *dentro del ciclo de vida* del contenedor;
+  tras un reinicio, la primera petición lo recarga en VRAM (~5 s desde disco, sin
+  re-descargar).
+
+---
+
+## 3. Prerrequisitos (verificar una vez)
 
 - WSL 2 con `systemd` habilitado: `/etc/wsl.conf` → `[boot] systemd=true`.
 - Docker dentro de WSL con el servicio systemd `enabled`:
@@ -49,9 +142,9 @@ Inicio de sesión Windows
 
 ---
 
-## 3. Archivos de la implementación
+## 4. Archivos de la implementación
 
-### 3.1. `docker-compose.yml` (dentro de `~/speaches`)
+### 4.1. `docker-compose.yml` (dentro de `~/speaches`)
 
 ```yaml
 services:
@@ -70,7 +163,7 @@ services:
       - ./hf_cache:/home/ubuntu/.cache/huggingface/hub
 ```
 
-### 3.2. Script de descarga + parche del modelo (`patch_model.py`)
+### 4.2. Script de descarga + parche del modelo (`patch_model.py`)
 
 Necesario porque el modelo `h2oai/faster-whisper-large-v3-turbo` no declara en su
 tarjeta de HuggingFace los metadatos que exige el *model registry* de Speaches
@@ -113,7 +206,7 @@ readme.write_text(card, encoding="utf-8")
 print("patched:", readme)
 ```
 
-### 3.3. Tarea programada de Windows (`register_task.ps1`)
+### 4.3. Tarea programada de Windows (`register_task.ps1`)
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -131,14 +224,14 @@ Register-ScheduledTask -TaskName 'WSL Speaches' -Action $action -Trigger $trigge
 
 ---
 
-## 4. Pasos de implementación
+## 5. Pasos de implementación
 
 ### Paso 1 — Estructura y compose
 
 ```bash
 mkdir -p ~/speaches/hf_cache
 cd ~/speaches
-# crear docker-compose.yml con el contenido de 3.1
+# crear docker-compose.yml con el contenido de 4.1
 docker compose config > /dev/null && echo "config OK"
 ```
 
@@ -153,7 +246,7 @@ cd ~/speaches && docker compose up -d
 ### Paso 3 — Descargar y parchear el modelo
 
 ```bash
-# copiar patch_model.py (3.2) al contenedor y ejecutarlo
+# copiar patch_model.py (4.2) al contenedor y ejecutarlo
 docker cp patch_model.py speaches-server:/tmp/patch_model.py
 docker exec speaches-server /home/ubuntu/speaches/.venv/bin/python /tmp/patch_model.py
 ```
@@ -197,18 +290,23 @@ docker stop faster-whisper-server && docker rm faster-whisper-server
 
 ---
 
-## 5. Lecciones aprendidas (evitar errores ya cometidos)
+## 6. Lecciones aprendidas (evitar errores ya cometidos)
 
 1. **No usar `latest-cuda` ni `latest-cuda-12.6.3`**: son v0.8.x, con esquema viejo
    (`WHISPER__TTL`, sin `STT_MODEL_TTL`). Usar `0.9.0-rc.1-cuda-12.6.3`.
-2. **`PRELOAD_MODELS` no está en ningún tag Docker publicado**: existe solo en
-   `v0.9.0-rc.3`, que no publicó imagen. Por tanto **no hay precarga al arranque**;
-   el modelo se carga en la primera petición (~5 s desde cache) y queda residente.
+2. **`PRELOAD_MODELS` está disponible desde `v0.9.0-rc.3`**, cuyas imágenes
+   (`0.9.0-rc.3-cuda-12.6.3`, etc.) ya están publicadas en GHCR. En `0.9.0-rc.1` (la
+   versión de esta guía) **no existe**, por lo que **no hay precarga al arranque**: el
+   modelo se carga en la primera petición (~5 s desde cache) y queda residente.
+   > Nota de temporalidad: en la fecha de la sesión de configuración (12/10/2026) el
+   > listado de GHCR **solo** contenía `0.9.0-rc.1-*`; las imágenes `0.9.0-rc.3-*` se
+   > publicaron posteriormente. Al replicar, verifica el listado actual de tags antes de
+   > asumir su existencia.
 3. **Variable de TTL correcta en rc.1 es `STT_MODEL_TTL`** (no `WHISPER__TTL`).
 4. **El *model registry* (v0.8+) rechaza modelos sin metadatos** `library_name`/
    `pipeline_tag`. Por eso el modelo `h2oai/...` da 404 en `POST /v1/models` y
    "not installed locally" en la transcripción. Solución: descargar manualmente y
-   parchear el `README.md` (sección 3.2).
+   parchear el `README.md` (sección 4.2).
 5. **`gpus: all` requiere Compose ≥ 2.30.** El bloque `deploy.resources.reservations.devices`
    solo funciona en Swarm, no con `docker compose up`.
 6. **El contenedor corre como `ubuntu` (UID 1000)**, no root; el cache está en
@@ -224,7 +322,7 @@ docker stop faster-whisper-server && docker rm faster-whisper-server
 
 ---
 
-## 6. Rollback y limpieza
+## 7. Rollback y limpieza
 
 ```bash
 # Rollback del contenedor
@@ -240,10 +338,14 @@ schtasks /Delete /TN "WSL Speaches" /F
 
 ---
 
-## 7. Nota sobre la precarga en el arranque
+## 8. Disponibilidad inmediata tras el arranque (warmup)
 
-Con esta configuración, tras un reinicio el modelo **no** está en VRAM hasta la
-primera petición (luego queda residente por `STT_MODEL_TTL=-1`). Si se requiere
-disponibilidad inmediata sin peticiones, añadir un "warmup" (p. ej. una petición de
-transcripción automática tras el arranque) o migrar a una imagen que soporte
-`PRELOAD_MODELS` (requiere compilar `v0.9.0-rc.3` desde el `Dockerfile`).
+Con esta configuración, tras reiniciar el contenedor el modelo **no** está en VRAM hasta
+la primera petición (ver §2.5: la VRAM se libera siempre al reiniciar, aunque
+`STT_MODEL_TTL=-1`). Desde disco se recarga en ~5 s, sin re-descargar.
+
+Si se requiere disponibilidad inmediata sin tráfico real, añadir un "warmup": una petición
+de transcripción automática tras el arranque (p. ej. un `curl` con un audio de prueba en
+el `healthcheck` o en un contenedor auxiliar). Alternativa: migrar a una imagen que soporte
+`PRELOAD_MODELS` (solo descarga en arranque, no carga en VRAM; ver §2.4) usando la imagen
+`0.9.0-rc.3-*` ya publicada.
