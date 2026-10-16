@@ -50,7 +50,7 @@ curl -s http://localhost:8000/v1/audio/transcriptions \
 
 Las variables `WHISPER__*` (`inference_device`, `compute_type`) solo configuran la
 **inferencia**, no la identidad del modelo. La única lista opcional es `PRELOAD_MODELS`
-(ver §2.4), que sirve para descargar en el arranque, no para fijar el modelo de las
+(ver sección 2.4), que sirve para descargar en el arranque, no para fijar el modelo de las
 peticiones.
 
 ### 2.2. Los tres estados de un modelo
@@ -68,7 +68,7 @@ A diferencia de `faster-whisper-server` (que descarga automáticamente a partir 
 modelo no está instalado, responde `"not installed locally"`.
 
 El modelo se deja disponible de forma **explícita y una sola vez** (queda persistente en
-disco, ver §2.5):
+disco, ver sección 2.5):
 
 ```bash
 # Vía oficial (funciona si la tarjeta HF ya declara library_name / pipeline_tag)
@@ -80,7 +80,7 @@ curl -X POST "http://localhost:8000/v1/models/Systran/faster-whisper-large-v3"
 
 El modelo `h2oai/faster-whisper-large-v3-turbo` **no** declara esos metadatos, por lo que
 la vía oficial falla (404 en `POST /v1/models` y `"not installed locally"`). De ahí el
-*workaround* de §4.2 (`patch_model.py`): descarga manual a `hf_cache` + parche del
+*workaround* de la sección 4.2 (`patch_model.py`): descarga manual a `hf_cache` + parche del
 `README.md`.
 
 ### 2.4. Precarga en el arranque (`PRELOAD_MODELS`)
@@ -95,12 +95,12 @@ environment:
 - **No lo carga en VRAM**; solo lo deja en disco. La carga en VRAM sigue ocurriendo en la
   primera petición.
 - ⚠️ No está disponible en la imagen `0.9.0-rc.1` de esta guía; se añadió en `0.9.0-rc.3`
-  (cuyas imágenes `0.9.0-rc.3-*` ya están publicadas en GHCR). Ver lección 2 de §6.
+  (cuyas imágenes `0.9.0-rc.3-*` ya están publicadas en GHCR). Ver lección 2 de la sección 6.
 - ⚠️ El modelo listado debe existir en el *registry* (metadatos `library_name`/
   `pipeline_tag`). `h2oai/faster-whisper-large-v3-turbo` no los declara, así que el
-  preload **fallaría** con él (error `Model ... not found` al arrancar). El parche de §4.2
+  preload **fallaría** con él (error `Model ... not found` al arrancar). El parche de la sección 4.2
   **no** lo evita: `PRELOAD_MODELS` valida contra el *registry remoto* de HuggingFace,
-  mientras que §4.2 solo corrige el README **local** (lo que habilita la transcripción,
+  mientras que la sección 4.2 solo corrige el README **local** (lo que habilita la transcripción,
   no la precarga). Precargar este modelo exigiría corregir sus metadatos en el propio repo
   de HuggingFace.
 
@@ -341,11 +341,144 @@ schtasks /Delete /TN "WSL Speaches" /F
 ## 8. Disponibilidad inmediata tras el arranque (warmup)
 
 Con esta configuración, tras reiniciar el contenedor el modelo **no** está en VRAM hasta
-la primera petición (ver §2.5: la VRAM se libera siempre al reiniciar, aunque
+la primera petición (ver sección 2.5: la VRAM se libera siempre al reiniciar, aunque
 `STT_MODEL_TTL=-1`). Desde disco se recarga en ~5 s, sin re-descargar.
 
 Si se requiere disponibilidad inmediata sin tráfico real, añadir un "warmup": una petición
 de transcripción automática tras el arranque (p. ej. un `curl` con un audio de prueba en
 el `healthcheck` o en un contenedor auxiliar). Alternativa: migrar a una imagen que soporte
-`PRELOAD_MODELS` (solo descarga en arranque, no carga en VRAM; ver §2.4) usando la imagen
+`PRELOAD_MODELS` (solo descarga en arranque, no carga en VRAM; ver sección 2.4) usando la imagen
 `0.9.0-rc.3-*` ya publicada.
+
+---
+
+## 9. Exposición del puerto 8000 a la red local (WSL2 en modo NAT)
+
+> Verificado en este equipo: WSL 2.7.3, red NAT por defecto (sin `.wslconfig`), `eth0` en
+> `192.168.88.x` (la subred NAT **varía** entre equipos y reinicios), IP LAN de Windows
+> `192.168.1.x`. El contenedor responde en `localhost:8000` pero **no** desde la LAN hasta
+> aplicar esta sección.
+
+### 9.1. Flujo del tráfico
+
+```
+Equipo LAN → http://<IP_Windows>:8000
+  → [portproxy netsh, iphlpsvc] → <IP_eth0_WSL>:8000
+    → [Docker publish 8000:8000] → contenedor:8000
+```
+
+Hacen falta dos piezas en Windows: un **portproxy** y una **regla de firewall** de entrada.
+La IP de WSL cambia al reiniciar, por lo que el portproxy debe refrescarse en cada arranque.
+
+### 9.2. Requisitos
+
+- PowerShell **como Administrador** (`netsh portproxy` y el firewall lo exigen).
+- Servicio IP Helper activo: `Get-Service iphlpsvc` → `Running` (`Set-Service iphlpsvc -StartupType Automatic`).
+- Perfil de red **Private** (`Get-NetConnectionProfile`). Si es Public, la regla de firewall no aplicará.
+- Contenedor publicado en `0.0.0.0:8000`: `docker port <contenedor>` → `8000/tcp -> 0.0.0.0:8000`.
+
+### 9.3. Script `expose_lan.ps1`
+
+Guardar, por ejemplo, en `C:\Users\<usuario>\expose_lan.ps1` (ejecutar como Administrador).
+Idempotente: se puede lanzar las veces que haga falta.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$port = 8000
+$rule = "Whisper $port (WSL)"
+
+# Mantener WSL vivo (si se apaga, el contenedor y el portproxy dejan de servir)
+Start-Process wsl.exe -ArgumentList '-d Ubuntu -e sleep infinity' -WindowStyle Hidden
+
+# IP de eth0 (hostname -I devuelve también los bridges de Docker; no fiarse del primer valor)
+$wslIp = $null
+for ($i = 0; $i -lt 30 -and -not $wslIp; $i++) {
+    try {
+        $wslIp = (wsl -d Ubuntu -e bash -c "ip -4 addr show eth0 | grep -oP '(?<=inet )\d+(\.\d+){3}'").Trim()
+    } catch { }
+    if (-not $wslIp) { Start-Sleep -Seconds 2 }
+}
+if (-not $wslIp) { throw 'No se pudo obtener la IP de eth0 en WSL' }
+
+# Portproxy (delete solo de esta regla; "reset" borraría todas)
+netsh interface portproxy delete v4tov4 listenport=$port listenaddress=0.0.0.0 2>$null | Out-Null
+netsh interface portproxy add v4tov4 listenport=$port listenaddress=0.0.0.0 connectport=$port connectaddress=$wslIp
+
+# Firewall: recrear para garantizar puerto/perfil correctos
+Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+New-NetFirewallRule -DisplayName $rule -Direction Inbound -Action Allow -Protocol TCP `
+    -LocalPort $port -Profile Private -RemoteAddress LocalSubnet | Out-Null
+
+netsh interface portproxy show all
+Write-Host "portproxy $port -> $wslIp listo"
+```
+
+`-RemoteAddress LocalSubnet` limita el acceso a la subred local (el portproxy conserva la IP
+de origen). Quitarlo solo si se necesita más alcance.
+
+### 9.4. Persistencia: tarea programada al iniciar sesión
+
+```powershell
+$action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+               -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\Users\<usuario>\expose_lan.ps1'
+$trigger   = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+               -RunLevel Highest -LogonType Interactive
+$settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName 'Whisper LAN expose' -Action $action -Trigger $trigger `
+  -Principal $principal -Settings $settings -Force
+```
+
+- `RunLevel Highest` es obligatorio (elevación para `netsh`).
+- Con `AtLogOn`, sin sesión iniciada no hay acceso LAN. Es lo habitual en un equipo de escritorio.
+- El script ya lanza `sleep infinity`, por lo que no depende de otras tareas que mantengan WSL vivo.
+
+### 9.5. Verificación
+
+```powershell
+netsh interface portproxy show all          # 0.0.0.0:8000 -> <IP eth0>:8000
+Get-NetFirewallRule -DisplayName 'Whisper 8000*' | Select DisplayName,Enabled,Profile
+curl.exe http://localhost:8000/health
+curl.exe http://<IP_Windows>:8000/health    # IP de `ipconfig`
+```
+
+Desde otro equipo de la LAN: `nc -zv <IP_Windows> 8000` y `curl http://<IP_Windows>:8000/health`.
+
+> `Get-NetTCPConnection -LocalPort 8000` **no** muestra el portproxy (lo atiende `iphlpsvc`,
+> no es un socket TCP normal). Usar `netsh interface portproxy show all`.
+
+### 9.6. Alternativa: `networkingMode=mirrored`
+
+`%USERPROFILE%\.wslconfig`:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+```
+
+Después `wsl --shutdown`. WSL comparte las interfaces de Windows y no hace falta portproxy,
+pero:
+
+- Se expone **toda** la VM, no solo el 8000.
+- El **firewall de Hyper-V** bloquea la entrada por defecto (`DefaultInboundAction=Block`).
+  Además de la regla de Windows Defender hace falta (como Administrador):
+  ```powershell
+  New-NetFirewallHyperVRule -Name 'Whisper8000' -DisplayName 'Whisper 8000' -Direction Inbound `
+    -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 8000
+  ```
+- Puede interferir con VPN y Docker Desktop.
+
+### 9.7. Seguridad
+
+- El servidor **no tiene autenticación**: cualquiera con acceso al puerto puede usar la API.
+  Mantener `-RemoteAddress LocalSubnet` o limitar a las IP necesarias.
+- No abrir el 8000 en el router ni exponerlo a Internet. Para acceso amplio, poner un reverse
+  proxy con autenticación delante.
+
+### 9.8. Rollback
+
+```powershell
+netsh interface portproxy delete v4tov4 listenport=8000 listenaddress=0.0.0.0
+Get-NetFirewallRule -DisplayName 'Whisper 8000 (WSL)' | Remove-NetFirewallRule
+Unregister-ScheduledTask -TaskName 'Whisper LAN expose' -Confirm:$false
+```
