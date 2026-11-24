@@ -114,7 +114,23 @@ sudo systemd-cryptenroll --wipe-slot=recovery /dev/nvme0n1p3
 
 ---
 
-## 5. Notas / lecciones
+## 5. Verificación post-reinicio (2026-10-21)
+
+Ejecutada tras un reinicio exitoso. Resultado:
+
+| Verificación | Resultado |
+|---|---|
+| `update-initramfs` presente | OK |
+| `dracut` (generador) ausente | OK |
+| `/etc/crypttab` = `… none luks,discard` | OK |
+| Hook de kernel = `initramfs-tools` | OK |
+| Kernel en ejecución | `7.0.0-38-generic` |
+| Token LUKS `systemd-tpm2` | Eliminado (solo queda `systemd-recovery`, keyslot 2) |
+| Arranque con passphrase manual | Confirmado (el reinicio fue exitoso) |
+
+La reversión quedó completa y el sistema arranca con el flujo nativo (passphrase + `initramfs-tools`).
+
+## 6. Notas / lecciones
 
 - `apt-get remove --purge dracut dracut-core` puede arrastrar `initramfs-tools` por el conflicto del paquete virtual `linux-initramfs-tool`. Si ocurre, reinstalar de inmediato: `apt-get install -y initramfs-tools cryptsetup-initramfs`.
 - La passphrase manual (keyslot 0) nunca se vio afectada; el sistema siempre conserva una vía de arranque.
